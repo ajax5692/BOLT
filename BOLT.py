@@ -170,6 +170,45 @@ def segment_mouse(gray, bg, mask, k_open, k_close):
     return (cx, cy), area, c, fg
 
 
+def process_chunk(args):
+    path, start_idx, num_frames, bg, track_mask, stim_roi, k_open, k_close = args
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, start_idx - 1))
+
+    prev_gray = None
+    if start_idx > 0:
+        ok, frame = cap.read()
+        if ok:
+            prev_gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+
+    xs, ys, areas, stim_dark, motion = [], [], [], [], []
+    sx0, sy0, sx1, sy1 = stim_roi
+    for _ in range(num_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        box = gray[sy0 + STIM_INNER_PAD:sy1 - STIM_INNER_PAD,
+                   sx0 + STIM_INNER_PAD:sx1 - STIM_INNER_PAD]
+        stim_dark.append(int((box < STIM_DARK_LEVEL).sum()))
+
+        centroid, area, _, _ = segment_mouse(gray, bg, track_mask, k_open, k_close)
+        xs.append(np.nan if centroid is None else centroid[0])
+        ys.append(np.nan if centroid is None else centroid[1])
+        areas.append(area)
+
+        if prev_gray is not None:
+            diff = cv2.absdiff(cv2.GaussianBlur(gray, (5, 5), 0), prev_gray)
+            diff = cv2.bitwise_and((diff > 12).astype(np.uint8) * 255, track_mask)
+            motion.append(int(cv2.countNonZero(diff)))
+        else:
+            motion.append(0)
+        prev_gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    cap.release()
+    return xs, ys, areas, stim_dark, motion
+
+
 def find_events(stim_on, fps):
     """Boolean per-frame stimulus flag -> list of (onset_frame, offset_frame)."""
     on = np.asarray(stim_on, bool)
@@ -250,51 +289,71 @@ def process(args):
 
     # --- frame loop -------------------------------------------------------
     sx0, sy0, sx1, sy1 = STIM_ROI
-    xs, ys, areas, stim_dark, motion = [], [], [], [], []
-    prev_gray = None
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    i = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if args.save_video:
+        print("Running sequentially to save QC video...")
+        xs, ys, areas, stim_dark, motion = [], [], [], [], []
+        prev_gray = None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        i = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            box = gray[sy0 + STIM_INNER_PAD:sy1 - STIM_INNER_PAD,
+                       sx0 + STIM_INNER_PAD:sx1 - STIM_INNER_PAD]
+            stim_dark.append(int((box < STIM_DARK_LEVEL).sum()))
 
-        # (1) stimulus detection - ONLY inside the stimulus box
-        p = STIM_INNER_PAD
-        box = gray[sy0 + p:sy1 - p, sx0 + p:sx1 - p]
-        stim_dark.append(int((box < STIM_DARK_LEVEL).sum()))
+            centroid, area, contour, _ = segment_mouse(gray, bg, track_mask, k_open, k_close)
+            xs.append(np.nan if centroid is None else centroid[0])
+            ys.append(np.nan if centroid is None else centroid[1])
+            areas.append(area)
 
-        # (2) mouse tracking - stimulus box & label are masked out
-        c, area, cnt, fg = segment_mouse(gray, bg, track_mask, k_open, k_close)
-        xs.append(np.nan if c is None else c[0])
-        ys.append(np.nan if c is None else c[1])
-        areas.append(area)
+            if prev_gray is not None:
+                diff = cv2.absdiff(cv2.GaussianBlur(gray, (5, 5), 0), prev_gray)
+                diff = cv2.bitwise_and((diff > 12).astype(np.uint8) * 255, track_mask)
+                motion.append(int(cv2.countNonZero(diff)))
+            else:
+                motion.append(0)
+            prev_gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # (3) frame-differencing "motion energy" (also masked) - robust freeze readout
-        if prev_gray is not None:
-            d = cv2.absdiff(cv2.GaussianBlur(gray, (5, 5), 0), prev_gray)
-            d = cv2.bitwise_and((d > 12).astype(np.uint8) * 255, track_mask)
-            motion.append(int(cv2.countNonZero(d)))
-        else:
-            motion.append(0)
-        prev_gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        if writer is not None:
             vis = frame.copy()
             cv2.rectangle(vis, (sx0, sy0), (sx1, sy1), (0, 165, 255), 1)
-            if cnt is not None:
-                cv2.drawContours(vis, [cnt], -1, (0, 255, 0), 1)
-                cv2.circle(vis, (int(c[0]), int(c[1])), 4, (0, 0, 255), -1)
+            if contour is not None:
+                cv2.drawContours(vis, [contour], -1, (0, 255, 0), 1)
+                cv2.circle(vis, (int(centroid[0]), int(centroid[1])), 4, (0, 0, 255), -1)
             if stim_dark[-1] >= STIM_MIN_DARK_PX:
                 cv2.putText(vis, "STIM", (5, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             writer.write(vis)
-        i += 1
-        if i % 1000 == 0:
-            print(f"  frame {i}/{n_frames}")
-    cap.release()
-    if writer is not None:
+            i += 1
+            if i % 1000 == 0:
+                print(f"  frame {i}/{n_frames}")
+        cap.release()
         writer.release()
+    else:
+        from multiprocessing import Pool, cpu_count
+
+        cap.release()
+        worker_count = min(max(1, (cpu_count() or 1) - 1), n_frames)
+        chunk_size, remainder = divmod(n_frames, worker_count)
+        chunks = []
+        start = 0
+        for index in range(worker_count):
+            count = chunk_size + (1 if index < remainder else 0)
+            chunks.append((path, start, count, bg, track_mask, STIM_ROI, k_open, k_close))
+            start += count
+
+        print(f"Processing {n_frames} frames in parallel using {worker_count} CPU cores...")
+        with Pool(worker_count) as pool:
+            results = pool.map(process_chunk, chunks)
+
+        xs, ys, areas, stim_dark, motion = [], [], [], [], []
+        for result in results:
+            xs.extend(result[0])
+            ys.extend(result[1])
+            areas.extend(result[2])
+            stim_dark.extend(result[3])
+            motion.extend(result[4])
 
     n = len(xs)
     t = np.arange(n) / fps
